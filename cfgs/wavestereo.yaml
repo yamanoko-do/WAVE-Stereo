@@ -1,0 +1,29 @@
+MODEL:
+  NAME: WAVEStereo
+  MAX_DISP: 192         # Due to 2d Cost aggregation, WAVE only support a fix disp range
+  EXPANSE_RATIO: 4
+  AGGREGATION_BLOCKS: [1, 2, 4]
+  CORR_LEVELS: 2
+  CORR_RADIUS: 4
+  TRAIN_ITERS: 12
+  VALID_ITERS: 4
+  LEFT_ATT: true
+  HIDDEN_DIM: 64
+  BACKBONE: MobileNetv2
+  TF_DIM: 128
+  TF_LAYERS: 3
+  TF_HEADS: 4
+  TF_MLP_RATIO: 3
+  TF_REFINE_EVERY: 3
+  TF_DPT_LEVELS: 2
+  PRETRAINED_MODEL: ""
+
+INFERENCE:
+  DEVICE: cuda
+  AMP: false
+  AMP_DTYPE: fp16
+  PAD_MODE: right_top
+  DIVISIBLE_BY: 32
+  SIZE: null
+  MEAN: [0.485, 0.456, 0.406]
+  STD: [0.229, 0.224, 0.225]
