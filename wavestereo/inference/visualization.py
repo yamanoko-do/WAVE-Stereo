@@ -33,5 +33,5 @@ def save_outputs(prefix: str | Path, disparity: np.ndarray, max_disp: float | No
     prefix = Path(prefix)
     prefix.parent.mkdir(parents=True, exist_ok=True)
     if save_npy:
-        np.save(prefix.with_suffix(".npy"), disparity.astype(np.float32))
-    cv2.imwrite(str(prefix.with_suffix(".png")), colorize_disparity(disparity, max_disp))
+        np.save(Path(f"{prefix}.npy"), disparity.astype(np.float32))
+    cv2.imwrite(str(Path(f"{prefix}.png")), colorize_disparity(disparity, max_disp))

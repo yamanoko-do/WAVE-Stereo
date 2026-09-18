@@ -211,9 +211,10 @@ class DPTResidualConv(nn.Module):
 
 
 class DPTFusionBlock(nn.Module):
-    def __init__(self, dim, out_dim=None):
+    def __init__(self, dim, out_dim=None, project_before_upsample=False):
         super().__init__()
         out_dim = out_dim or dim
+        self.project_before_upsample = project_before_upsample
         self.res_conf_unit1 = DPTResidualConv(dim)
         self.res_conf_unit2 = DPTResidualConv(dim)
         self.out_conv = nn.Conv2d(dim, out_dim, 1, bias=True)
@@ -224,6 +225,12 @@ class DPTFusionBlock(nn.Module):
             out = out + self.res_conf_unit1(skip_feat)
         out = self.res_conf_unit2(out)
 
+        # A pointwise affine projection commutes with bilinear interpolation.
+        # Applying it at the lower resolution is therefore mathematically
+        # equivalent while substantially reducing work when out_dim <= dim.
+        if self.project_before_upsample:
+            out = self.out_conv(out)
+
         if target_size is None:
             target_size = (main_feat.shape[2] * 2, main_feat.shape[3] * 2)
 
@@ -231,7 +238,9 @@ class DPTFusionBlock(nn.Module):
             out = F.interpolate(
                 out.float(), size=target_size, mode='bilinear', align_corners=False
             ).to(main_feat.dtype)
-        return self.out_conv(out)
+        if not self.project_before_upsample:
+            out = self.out_conv(out)
+        return out
 
 
 class SimplifiedDPT(nn.Module):

@@ -4,15 +4,16 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import yaml
+
+from wavestereo.artifacts import (
+    bundle_input_shape,
+    bundle_normalization,
+    resolve_tensorrt_engine,
+)
 
 
-def normalize_image(img: torch.Tensor, mean=None, std=None) -> torch.Tensor:
-    """Normalize BCHW image tensors in [0, 1] with ImageNet defaults."""
-    if mean is None:
-        mean = [0.485, 0.456, 0.406]
-    if std is None:
-        std = [0.229, 0.224, 0.225]
+def normalize_image(img: torch.Tensor, mean, std) -> torch.Tensor:
+    """Normalize BCHW image tensors in [0, 1] from bundle metadata."""
     mean_t = img.new_tensor(mean).view(1, 3, 1, 1)
     std_t = img.new_tensor(std).view(1, 3, 1, 1)
     return (img - mean_t) / std_t
@@ -25,8 +26,9 @@ class TrtRunner:
         import tensorrt as trt
 
         self.cfg = cfg
-        self.normalize_mean = cfg.get("normalize_mean", [0.485, 0.456, 0.406])
-        self.normalize_std = cfg.get("normalize_std", [0.229, 0.224, 0.225])
+        self.input_shape = bundle_input_shape(cfg)
+        self.normalize_mean, self.normalize_std = bundle_normalization(cfg)
+        self.max_disp = float(cfg["model"]["max_disp"])
         self.trt = trt
         self.logger = trt.Logger(trt.Logger.WARNING)
 
@@ -39,6 +41,22 @@ class TrtRunner:
                 "TensorRT versions may differ; rebuild the engine with trtexec."
             )
         self.context = self.engine.create_execution_context()
+        input_names, output_names = self._get_io_names()
+        if set(input_names) != {"left_image", "right_image"}:
+            raise ValueError(
+                f"TensorRT engine inputs must be left_image/right_image, got {input_names}"
+            )
+        if output_names != ["disparity"]:
+            raise ValueError(
+                f"TensorRT engine output must be disparity, got {output_names}"
+            )
+        for name in input_names:
+            engine_shape = tuple(int(value) for value in self.engine.get_tensor_shape(name))
+            if engine_shape != self.input_shape:
+                raise ValueError(
+                    f"TensorRT engine input {name!r} has shape {engine_shape}, "
+                    f"but bundle metadata declares {self.input_shape}"
+                )
 
     def _trt_to_torch_dtype(self, dt):
         trt = self.trt
@@ -107,46 +125,14 @@ class TrtRunner:
         return self.forward(left_img, right_img)
 
 
-def resolve_onnx_cfg_path(onnx_dir: str | Path) -> Path:
-    onnx_dir = Path(onnx_dir)
-    candidates = [onnx_dir / "onnx.yaml", onnx_dir.parent / "onnx.yaml"]
-    for path in candidates:
-        if path.exists():
-            return path
-    raise FileNotFoundError(f"onnx.yaml not found. Searched: {candidates}")
+def load_trt_runner(model_dir: str | Path) -> TrtRunner:
+    """Load one canonical TensorRT model bundle.
 
-
-def make_res_tag_from_cfg(cfg: dict[str, Any]) -> str:
-    h, w = cfg.get("image_size", [736, 1280])
-    iters = cfg.get("valid_iters", 8)
-    return f"{h}x{w}_iter{iters}"
-
-
-def find_engine(onnx_dir: str | Path, res_tag: str | None = None, cfg: dict[str, Any] | None = None) -> Path:
-    onnx_dir = Path(onnx_dir)
-    candidates = []
-    if cfg and cfg.get("engine_filename"):
-        candidates.append(onnx_dir / cfg["engine_filename"])
-    if res_tag is None and cfg:
-        res_tag = make_res_tag_from_cfg(cfg)
-    if res_tag is not None:
-        candidates.append(onnx_dir / f"wavestereo_{res_tag}.engine")
-    if cfg:
-        h, w = cfg.get("image_size", [736, 1280])
-        iters = cfg.get("valid_iters", 8)
-        candidates.append(onnx_dir / f"wavestereo_{h}x{w}_iter{iters}.engine")
-    for path in candidates:
-        if path.exists():
-            return path
-    raise FileNotFoundError(
-        f"WAVEStereo engine not found in {onnx_dir}. Searched: {', '.join(map(str, candidates))}"
-    )
-
-
-def load_trt_runner(onnx_dir: str | Path) -> TrtRunner:
-    cfg_path = resolve_onnx_cfg_path(onnx_dir)
-    with cfg_path.open("r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
-    engine_path = find_engine(onnx_dir, make_res_tag_from_cfg(cfg), cfg)
+    ``model_dir`` must be the exact directory containing ``metadata.yaml`` and
+    ``model.engine``.  Parent-directory discovery and legacy filenames are
+    intentionally unsupported.
+    """
+    model_dir = Path(model_dir)
+    engine_path, cfg = resolve_tensorrt_engine(model_dir)
     print(f"[INFO] Loaded TensorRT engine: {engine_path.name}")
     return TrtRunner(cfg, engine_path)

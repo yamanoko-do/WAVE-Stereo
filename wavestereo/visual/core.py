@@ -56,10 +56,6 @@ class LatencyMonitor:
             if frame_id in self.frame_timestamps:
                 self.frame_timestamps[frame_id]['queue_in'] = time.time()
 
-    def record_queue_in(self, frame_id: int):
-        """DEPRECATED: Kept for compatibility, use record_capture_complete instead"""
-        pass
-
     def record_inference_start(self, frame_id: int):
         """Record when inference starts (end of Queue Wait, start of Inference)"""
         with self.lock:
@@ -107,16 +103,32 @@ class LatencyMonitor:
 
                 # Clean up old data
                 if len(self.frame_timestamps) > 100:
-                    oldest = min(self.frame_timestamps.keys())
-                    if oldest < frame_id - 100:
-                        del self.frame_timestamps[oldest]
+                    cutoff = frame_id - 100
+                    stale_frame_ids = [
+                        old_frame_id
+                        for old_frame_id in self.frame_timestamps
+                        if old_frame_id < cutoff
+                    ]
+                    for old_frame_id in stale_frame_ids:
+                        del self.frame_timestamps[old_frame_id]
 
     def get_latency_stats(self) -> Optional[Dict[str, float]]:
         """Get detailed latency statistics"""
-        if not self.latencies:
-            return None
-
-        latencies = list(self.latencies)
+        # Capture one consistent snapshot while writers are excluded. Camera,
+        # inference and display threads all update these containers, so even a
+        # seemingly harmless list()/items() iteration must be protected.
+        with self.lock:
+            if not self.latencies:
+                return None
+            latencies = tuple(self.latencies)
+            stage_latencies = {
+                name: tuple(values)
+                for name, values in self.stage_latencies.items()
+            }
+            frame_timestamps = {
+                frame_id: timestamps.copy()
+                for frame_id, timestamps in self.frame_timestamps.items()
+            }
 
         def safe_avg(d):
             return sum(d) / len(d) if d else 0
@@ -125,29 +137,58 @@ class LatencyMonitor:
             'total_avg': safe_avg(latencies) * 1000,
             'total_min': min(latencies) * 1000,
             'total_max': max(latencies) * 1000,
-            'frame_diff': self._calculate_frame_diff(),
-            'stage_capture': safe_avg(self.stage_latencies['capture_to_queue']),
-            'stage_queue_wait': safe_avg(self.stage_latencies['queue_to_infer']),
-            'stage_inference': safe_avg(self.stage_latencies['inference_proc']),
-            'stage_output_wait': safe_avg(self.stage_latencies['output_queue_wait']),
-            'stage_real_postproc': safe_avg(self.stage_latencies['real_post_proc']),
+            'frame_diff': self._calculate_frame_diff(frame_timestamps),
+            'stage_capture': safe_avg(stage_latencies['capture_to_queue']),
+            'stage_queue_wait': safe_avg(stage_latencies['queue_to_infer']),
+            'stage_inference': safe_avg(stage_latencies['inference_proc']),
+            'stage_output_wait': safe_avg(stage_latencies['output_queue_wait']),
+            'stage_real_postproc': safe_avg(stage_latencies['real_post_proc']),
         }
 
-    def _calculate_frame_diff(self) -> int:
+    @staticmethod
+    def _calculate_frame_diff(
+        frame_timestamps: Dict[int, Dict[str, Optional[float]]],
+    ) -> int:
         """Calculate frame lag"""
-        if not self.frame_timestamps:
+        if not frame_timestamps:
             return 0
         latest_capture = 0
         latest_frame_id = 0
-        for frame_id, timestamps in self.frame_timestamps.items():
+        for frame_id, timestamps in frame_timestamps.items():
             if timestamps.get('capture', 0) > latest_capture:
                 latest_capture = timestamps['capture']
                 latest_frame_id = frame_id
         last_display_frame = 0
-        for frame_id, timestamps in self.frame_timestamps.items():
+        for frame_id, timestamps in frame_timestamps.items():
             if timestamps.get('display') and frame_id > last_display_frame:
                 last_display_frame = frame_id
         return latest_frame_id - last_display_frame
+
+
+def resize_rectification_maps(
+    map_x: np.ndarray,
+    map_y: np.ndarray,
+    target_width: int,
+    target_height: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resample full-resolution rectification maps for direct low-res remap.
+
+    The map values remain coordinates in the original camera image; only the
+    destination grid is resized.  A subsequent cv2.remap therefore combines
+    rectification and inference downscaling in one interpolation pass.
+    """
+    if map_x.shape != map_y.shape or map_x.ndim != 2:
+        raise ValueError(
+            f"Rectification maps must be matching 2D arrays, got "
+            f"{map_x.shape} and {map_y.shape}"
+        )
+    if target_width <= 0 or target_height <= 0:
+        raise ValueError("Inference resolution must be positive")
+    size = (int(target_width), int(target_height))
+    return (
+        cv2.resize(map_x, size, interpolation=cv2.INTER_LINEAR),
+        cv2.resize(map_y, size, interpolation=cv2.INTER_LINEAR),
+    )
 
 
 class AsyncCamera:
@@ -158,7 +199,9 @@ class AsyncCamera:
     def __init__(self, max_queue_size: int = 2, map_dir: str = "./data",
                  latency_monitor: Optional[LatencyMonitor] = None,
                  vid_pid: str = "0211:5838", camera=None,
-                 camera_resolution: Optional[Tuple[int, int]] = None):
+                 camera_resolution: Optional[Tuple[int, int]] = None,
+                 inference_resolution: Optional[Tuple[int, int]] = None,
+                 preprocessing_mode: str = "auto"):
         # External camera source (video file, etc.)
         if camera is not None:
             self.cam = camera
@@ -192,12 +235,155 @@ class AsyncCamera:
                 print(f"[INFO] Using generic BinocularCam class (VID:PID={vid_pid})")
                 self.cam = BinocularCam(vid_pid=vid_pid, map_dir=map_dir,
                                         resolution=camera_resolution)
+        self.inference_resolution = (
+            tuple(int(value) for value in inference_resolution)
+            if inference_resolution is not None
+            else None
+        )
+        if preprocessing_mode not in ("auto", "legacy"):
+            raise ValueError(
+                "Camera preprocessing mode must be 'auto' or 'legacy', "
+                f"got {preprocessing_mode!r}"
+            )
+        self.preprocessing_mode = preprocessing_mode
+        self._inference_rectify_maps = None
+        self.fused_rectify_resize = False
+        self._configure_inference_preprocessing()
         self.frame_queue = queue.Queue(maxsize=max_queue_size)
         self.stopped = False
         self.frame_count = 0
         self.latency_monitor = latency_monitor
         self.thread = None
         self.lock = threading.Lock()
+
+    def _configure_inference_preprocessing(self):
+        if self.inference_resolution is None:
+            return
+        target_w, target_h = self.inference_resolution
+        if target_w <= 0 or target_h <= 0:
+            raise ValueError("Inference resolution must be positive")
+
+        map_names = ("map1x", "map1y", "map2x", "map2y")
+        maps = tuple(getattr(self.cam, name, None) for name in map_names)
+        has_maps = all(value is not None for value in maps)
+        map_resolution_differs = bool(
+            has_maps and maps[0].shape[:2] != (target_h, target_w)
+        )
+        if (
+            self.preprocessing_mode == "auto"
+            and map_resolution_differs
+            and callable(getattr(self.cam, "get_frame", None))
+        ):
+            map1x, map1y = resize_rectification_maps(
+                maps[0], maps[1], target_w, target_h
+            )
+            map2x, map2y = resize_rectification_maps(
+                maps[2], maps[3], target_w, target_h
+            )
+            self._inference_rectify_maps = (map1x, map1y, map2x, map2y)
+            self.fused_rectify_resize = True
+            print(
+                "[INFO] Camera preprocessing: auto (rectification + resize in one remap) "
+                f"to {target_w}x{target_h}"
+            )
+            print(
+                "[WARNING] Auto camera preprocessing uses one interpolation "
+                "pass and is not bit-identical to full-resolution rectification "
+                "followed by resize"
+            )
+        else:
+            reason = (
+                "legacy full-resolution rectification followed by resize"
+                if self.preprocessing_mode == "legacy"
+                else "capture-thread resize"
+            )
+            print(
+                f"[INFO] Camera preprocessing: {reason} to "
+                f"{target_w}x{target_h}"
+            )
+
+    @staticmethod
+    def _validate_frame_image(
+        image: np.ndarray,
+        *,
+        eye: str,
+        target_width: int,
+        target_height: int,
+    ) -> np.ndarray:
+        image = np.asarray(image)
+        if image.shape != (target_height, target_width, 3):
+            raise ValueError(
+                f"{eye} camera frame must have shape "
+                f"{target_height}x{target_width}x3, got {image.shape}"
+            )
+        if image.dtype != np.uint8:
+            raise ValueError(
+                f"{eye} camera frame must be uint8 BGR, got {image.dtype}"
+            )
+        return np.ascontiguousarray(image)
+
+    def _resize_frame(self, frame):
+        if frame is None:
+            return None
+        if self.inference_resolution is None:
+            return frame
+
+        target_w, target_h = self.inference_resolution
+        left = frame["left"]
+        right = frame["right"]
+        if left.shape[:2] != (target_h, target_w):
+            left = cv2.resize(
+                left, (target_w, target_h), interpolation=cv2.INTER_LINEAR
+            )
+        if right.shape[:2] != (target_h, target_w):
+            right = cv2.resize(
+                right, (target_w, target_h), interpolation=cv2.INTER_LINEAR
+            )
+        return {
+            "left": self._validate_frame_image(
+                left,
+                eye="Left",
+                target_width=target_w,
+                target_height=target_h,
+            ),
+            "right": self._validate_frame_image(
+                right,
+                eye="Right",
+                target_width=target_w,
+                target_height=target_h,
+            ),
+        }
+
+    def _capture_frame(self):
+        if self._inference_rectify_maps is not None:
+            raw = self.cam.get_frame()
+            if raw is None:
+                return None
+            map1x, map1y, map2x, map2y = self._inference_rectify_maps
+            left = cv2.remap(
+                raw["left"], map1x, map1y, interpolation=cv2.INTER_LINEAR
+            )
+            right = cv2.remap(
+                raw["right"], map2x, map2y, interpolation=cv2.INTER_LINEAR
+            )
+            return self._resize_frame({"left": left, "right": right})
+
+        map_names = ("map1x", "map1y", "map2x", "map2y")
+        declares_maps = any(hasattr(self.cam, name) for name in map_names)
+        has_maps = declares_maps and all(
+            getattr(self.cam, name, None) is not None for name in map_names
+        )
+        rectify = getattr(self.cam, "get_rectifyframe", None)
+        raw = getattr(self.cam, "get_frame", None)
+        if callable(rectify) and (has_maps or not declares_maps):
+            frame = rectify()
+        elif callable(raw):
+            frame = raw()
+        else:
+            raise TypeError(
+                "Camera source must provide get_rectifyframe() or get_frame()"
+            )
+        return self._resize_frame(frame)
 
     def start(self):
         """Start camera thread"""
@@ -216,7 +402,7 @@ class AsyncCamera:
                 if self.latency_monitor:
                     self.latency_monitor.record_frame_capture_start(current_id, last_capture_time)
 
-                frame = self.cam.get_rectifyframe()
+                frame = self._capture_frame()
 
                 if frame is not None:
                     now = time.time()
@@ -280,11 +466,6 @@ class Preprocessor:
         self.target_h = target_height
         self.target_w = target_width
 
-        # Pre-allocated buffers for fast fused path
-        self._fast_buf_l = None   # float32 numpy buffer
-        self._fast_buf_r = None
-        self._fast_pad_h = 0
-        self._fast_pad_w = 0
         self._use_fast_path = False
 
         if transform_config is not None:
@@ -312,8 +493,6 @@ class Preprocessor:
         if (self.pad_type == 'RightTopPad' and self.target_h and self.target_w
                 and self.device.type == 'cuda'):
             # Pre-allocate GPU tensors to avoid repeated numpy→torch→GPU copies
-            self._fast_buf_l_cpu = np.zeros((self.target_h, self.target_w, 3), dtype=np.float32)
-            self._fast_buf_r_cpu = np.zeros((self.target_h, self.target_w, 3), dtype=np.float32)
             self._fast_gpu_l = torch.zeros(1, 3, self.target_h, self.target_w,
                                            device=device, dtype=torch.float32)
             self._fast_gpu_r = torch.zeros(1, 3, self.target_h, self.target_w,
@@ -407,22 +586,46 @@ class Preprocessor:
             pad_w = max(0, self.target_w - orig_w) if self.target_w else 0
 
             if self.target_h and self.target_w:
-                if self._fast_buf_l is None:
-                    self._fast_buf_l = np.zeros((self.target_h, self.target_w, 3), dtype=np.float32)
-                    self._fast_buf_r = np.zeros((self.target_h, self.target_w, 3), dtype=np.float32)
+                if self.target_h < orig_h or self.target_w < orig_w:
+                    raise ValueError(
+                        f"{self.pad_type} target ({self.target_w}x{self.target_h}) "
+                        f"is smaller than input frame ({orig_w}x{orig_h})"
+                    )
+                if self.pad_type == 'RightTopPad':
+                    pad_top, pad_bottom = pad_h, 0
+                elif self.pad_type == 'RightBottomPad':
+                    pad_top, pad_bottom = 0, pad_h
                 else:
-                    self._fast_buf_l.fill(0)
-                    self._fast_buf_r.fill(0)
-                self._fast_buf_l[pad_h:pad_h + orig_h, :orig_w, :] = left_img
-                self._fast_buf_r[pad_h:pad_h + orig_h, :orig_w, :] = right_img
-                left_tensor = torch.from_numpy(self._fast_buf_l).permute(2, 0, 1).unsqueeze(0).contiguous()
-                right_tensor = torch.from_numpy(self._fast_buf_r).permute(2, 0, 1).unsqueeze(0).contiguous()
+                    raise ValueError(
+                        f"Unsupported inference padding mode: {self.pad_type}"
+                    )
+                left_img = cv2.copyMakeBorder(
+                    left_img,
+                    pad_top,
+                    pad_bottom,
+                    0,
+                    pad_w,
+                    borderType=cv2.BORDER_REPLICATE,
+                )
+                right_img = cv2.copyMakeBorder(
+                    right_img,
+                    pad_top,
+                    pad_bottom,
+                    0,
+                    pad_w,
+                    borderType=cv2.BORDER_REPLICATE,
+                )
+                pad_h = pad_top
+                left_tensor = torch.from_numpy(left_img).permute(2, 0, 1).unsqueeze(0).contiguous()
+                right_tensor = torch.from_numpy(right_img).permute(2, 0, 1).unsqueeze(0).contiguous()
             else:
                 left_tensor = torch.from_numpy(left_img).permute(2, 0, 1).unsqueeze(0).contiguous()
                 right_tensor = torch.from_numpy(right_img).permute(2, 0, 1).unsqueeze(0).contiguous()
 
-            left_tensor = left_tensor.float().div_(255.0).mul_(self._norm_scale.cpu()).add_(self._norm_bias.cpu())
-            right_tensor = right_tensor.float().div_(255.0).mul_(self._norm_scale.cpu()).add_(self._norm_bias.cpu())
+            # _norm_scale already includes the 1/255 factor, matching the
+            # CUDA fused path above.
+            left_tensor = left_tensor.float().mul_(self._norm_scale.cpu()).add_(self._norm_bias.cpu())
+            right_tensor = right_tensor.float().mul_(self._norm_scale.cpu()).add_(self._norm_bias.cpu())
 
             if self.device.type == 'cuda':
                 left_tensor = left_tensor.to(self.device, non_blocking=True)
@@ -542,9 +745,9 @@ def display_latency_overlay(disp_color: np.ndarray, frame_id: int,
 
     title = f"{prefix} FPS: {avg_fps:.1f}" if prefix else f"FPS: {avg_fps:.1f}"
     cv2.putText(disp_color, title, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    # Model GPU FPS — pure model ceiling, matching profile_runtime reciprocal
+    # Model-only FPS — pure inference ceiling for the selected backend.
     if model_fps > 0:
-        cv2.putText(disp_color, f"Model: {model_fps:.1f} FPS (GPU)",
+        cv2.putText(disp_color, f"Model: {model_fps:.1f} FPS",
                     (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         y_text = 95
     else:
@@ -619,5 +822,5 @@ def print_latency_stats(frame_id: int, latency_stats: Dict[str, float], avg_fps:
         print(f"  {'Total (min/max)':<18} | {latency_stats['total_min']:.1f}/{latency_stats['total_max']:.1f} | ")
         print(f"  {'Frame Lag':<18} | {latency_stats['frame_diff']} frames | ")
         if model_fps > 0:
-            print(f"  {'Model FPS (GPU)':<18} | {model_fps:.1f} | ")
+            print(f"  {'Model FPS':<18} | {model_fps:.1f} | ")
         print(f"  {'Current FPS':<18} | {avg_fps:.1f} | ")

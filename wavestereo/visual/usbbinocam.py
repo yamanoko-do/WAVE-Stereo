@@ -54,7 +54,6 @@ class BinocularCam():
             print("[WARNING] 未提供校正映射表目录，无法使用 get_rectifyframe() 方法")
 
         # 打开视频流
-        print(device_id)
         self.cap = cv2.VideoCapture(device_id, cv2.CAP_V4L2)
         if not self.cap.isOpened():
             raise RuntimeError(f"无法打开摄像头 {self.device_path}")
@@ -392,7 +391,6 @@ if __name__ == "__main__":
     finally:
         cam.stop()
         cv2.destroyAllWindows()
-
 
 
 

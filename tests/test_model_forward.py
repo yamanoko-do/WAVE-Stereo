@@ -10,3 +10,6 @@ def test_model_constructs_from_public_config():
     cfg = load_config("cfgs/wavestereo.yaml")
     model = WAVEStereo(cfg.MODEL)
     assert model.max_disp == cfg.MODEL.MAX_DISP
+    assert model.context_upsample_mode == cfg.MODEL.CONTEXT_UPSAMPLE_MODE
+    assert model.context_upsample_sigma == cfg.MODEL.CONTEXT_UPSAMPLE_SIGMA
+    assert model.context_upsample_reference_mode == "argmax"

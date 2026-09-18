@@ -18,6 +18,30 @@ class PadInfo:
     original_hw: tuple[int, int]
 
 
+def normalization_from_config(config: Any) -> tuple[list[float], list[float]]:
+    """Read and validate the sole configured image-normalization values."""
+    mean = config.get("MEAN")
+    std = config.get("STD")
+    if (
+        not isinstance(mean, (list, tuple))
+        or not isinstance(std, (list, tuple))
+        or len(mean) != 3
+        or len(std) != 3
+        or any(isinstance(value, bool) for value in (*mean, *std))
+    ):
+        raise ValueError("INFERENCE.MEAN/STD must each contain three numbers")
+    try:
+        mean = [float(value) for value in mean]
+        std = [float(value) for value in std]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("INFERENCE.MEAN/STD must be numeric") from exc
+    if not all(np.isfinite(value) for value in (*mean, *std)):
+        raise ValueError("INFERENCE.MEAN/STD must be finite")
+    if any(value <= 0.0 for value in std):
+        raise ValueError("INFERENCE.STD values must be positive")
+    return mean, std
+
+
 def load_image(image: str | Path | Image.Image | np.ndarray, rgb_input: bool = True) -> np.ndarray:
     if isinstance(image, (str, Path)):
         arr = np.array(Image.open(image).convert("RGB"))

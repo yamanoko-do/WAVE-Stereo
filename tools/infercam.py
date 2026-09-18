@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
-import logging
+import os
+import shutil
+import subprocess
 import sys
 import time
 from collections import deque
@@ -14,19 +16,90 @@ if str(ROOT) not in sys.path:
 
 import cv2
 import numpy as np
-import torch
 
-from wavestereo.config import load_config
+
+_FONT_SUFFIXES = {".otf", ".ttc", ".ttf"}
+
+
+def _directory_has_fonts(directory: Path) -> bool:
+    try:
+        return any(
+            entry.is_file() and entry.suffix.lower() in _FONT_SUFFIXES
+            for entry in directory.iterdir()
+        )
+    except OSError:
+        return False
+
+
+def _find_system_qt_font_dir() -> Path | None:
+    fc_match = shutil.which("fc-match")
+    if fc_match:
+        try:
+            result = subprocess.run(
+                [fc_match, "--format=%{file}\\n", "sans-serif"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            for line in result.stdout.splitlines():
+                font_file = Path(line.strip()).expanduser()
+                if font_file.is_file() and font_file.suffix.lower() in _FONT_SUFFIXES:
+                    return font_file.parent
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    font_roots = (
+        Path(sys.prefix) / "share" / "fonts",
+        Path(sys.prefix) / "lib" / "fonts",
+        Path("/usr/local/share/fonts"),
+        Path("/usr/share/fonts"),
+        Path.home() / ".local" / "share" / "fonts",
+        Path.home() / ".fonts",
+    )
+    for root in font_roots:
+        if not root.is_dir():
+            continue
+        try:
+            for font_file in root.rglob("*"):
+                if font_file.is_file() and font_file.suffix.lower() in _FONT_SUFFIXES:
+                    return font_file.parent
+        except OSError:
+            continue
+    return None
+
+
+def _configure_qt_font_dir() -> None:
+    """Replace OpenCV/Conda missing font paths with a real system font directory."""
+    if not sys.platform.startswith("linux"):
+        return
+
+    configured_dir = os.environ.get("QT_QPA_FONTDIR")
+    if configured_dir and _directory_has_fonts(Path(configured_dir).expanduser()):
+        return
+
+    system_font_dir = _find_system_qt_font_dir()
+    if system_font_dir is not None:
+        os.environ["QT_QPA_FONTDIR"] = str(system_font_dir)
+    else:
+        os.environ.pop("QT_QPA_FONTDIR", None)
+
+
+_configure_qt_font_dir()
+
+from wavestereo.inference.runtime import (
+    add_backend_arguments,
+    add_postprocessing_arguments,
+    build_runtime,
+    validate_backend_args,
+)
 from wavestereo.visual.async_inference import (
     AsyncInference,
-    PyTorchBackend,
-    TensorRTBackend,
     create_visualization_from_raw,
 )
 from wavestereo.visual.core import (
     AsyncCamera,
     LatencyMonitor,
-    Preprocessor,
     display_latency_overlay,
     load_camera_params,
     load_camera_resolution,
@@ -34,120 +107,93 @@ from wavestereo.visual.core import (
 )
 from wavestereo.visual.pointcloud import O3DVisualizer, PointCloudProcessor
 from wavestereo.visual.video_source import StereoVideoSource
-from wavestereo.visual.visualization import check_and_fix_invalid, create_disparity_colormap
+from wavestereo.visual.visualization import create_disparity_colormap
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Run WAVE-Stereo live camera/video inference")
-    parser.add_argument("--config", "--cfg_file", dest="config", default="cfgs/wavestereo.yaml")
-    parser.add_argument("--weights", "--pretrained_model", dest="weights", default=None)
-    parser.add_argument("--onnx-dir", "--onnx_dir", dest="onnx_dir", default=None)
-    parser.add_argument("--trt", action="store_true", help="Use TensorRT backend; requires --onnx-dir")
-    parser.add_argument("--cam_file", "--cam-file", dest="cam_file", default="cfgs/camera/pxyzd435/")
+    add_backend_arguments(parser)
+    parser.add_argument("--cam-file", default="cfgs/camera/pxyzd435/")
     parser.add_argument("--video", default=None, help="Side-by-side stereo video; replaces live camera")
-    parser.add_argument("--device", default=None)
-    parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--skip-frames", "--skip_frames", dest="skip_frames", type=int, default=1)
-    parser.add_argument("--display-stride", "--display_stride", dest="display_stride", type=int, default=1)
+    parser.add_argument("--skip-frames", type=int, default=1)
+    parser.add_argument("--display-stride", type=int, default=1)
     parser.add_argument("--zfar", type=float, default=9.0)
     parser.add_argument("--subsample", type=int, default=2)
-    return parser.parse_args()
+    add_postprocessing_arguments(parser)
+    parser.add_argument(
+        "--camera-preprocess",
+        choices=("auto", "legacy"),
+        default="auto",
+        help=(
+            "Camera rectification policy. auto combines rectification and "
+            "resize into one target-resolution remap when calibration maps "
+            "are available; legacy rectifies at source resolution first"
+        ),
+    )
+    return parser.parse_args(argv)
 
 
-def _ceil_to_multiple(value: int, multiple: int) -> int:
-    return ((value + multiple - 1) // multiple) * multiple
-
-
-def _infer_target_size_from_config(cfgs, orig_h: int, orig_w: int):
-    infer_cfg = cfgs.get("INFERENCE", {})
-    size = infer_cfg.get("SIZE", None)
-    if size:
-        return int(size[0]), int(size[1])
-    by = int(infer_cfg.get("DIVISIBLE_BY", 32))
-    return _ceil_to_multiple(orig_h, by), _ceil_to_multiple(orig_w, by)
-
-
-def _make_transform_config(cfgs, target_h: int, target_w: int):
-    infer_cfg = cfgs.get("INFERENCE", {})
-    pad_mode = str(infer_cfg.get("PAD_MODE", "right_top")).lower().replace("-", "_")
-    pad_name = "RightTopPad" if pad_mode in ("right_top", "righttoppad") else "RightBottomPad"
-    return [
-        {"NAME": pad_name, "SIZE": [target_h, target_w]},
-        {"NAME": "NormalizeImage", "MEAN": infer_cfg.get("MEAN", [0.485, 0.456, 0.406]),
-         "STD": infer_cfg.get("STD", [0.229, 0.224, 0.225])},
-    ]
-
-
-def _load_trt_image_size(onnx_dir: str):
-    import yaml
-
-    cfg_path = Path(onnx_dir) / "onnx.yaml"
-    if not cfg_path.exists():
-        return 736, 1280
-    with cfg_path.open("r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
-    size = cfg.get("image_size", [736, 1280])
-    return int(size[0]), int(size[1])
-
-
-@torch.no_grad()
 def main():
     args = parse_args()
-    if args.trt and not args.onnx_dir:
-        raise SystemExit("--trt requires --onnx-dir")
-
-    device = torch.device(args.device or ("cuda:0" if torch.cuda.is_available() else "cpu"))
-    if device.type == "cuda":
-        torch.cuda.set_device(device)
+    validate_backend_args(args)
+    if args.disparity_upsample_sigma <= 0:
+        raise SystemExit("--disparity-upsample-sigma must be positive")
 
     K, baseline, vidpid_content = load_camera_params(args.cam_file)
-    orig_w, orig_h = load_camera_resolution(args.cam_file)
-    latency_monitor = LatencyMonitor()
-    prefix = "[TRT] " if args.trt else ""
-
-    if args.trt:
-        target_h, target_w = _load_trt_image_size(args.onnx_dir)
-        if target_h < orig_h or target_w < orig_w:
-            raise ValueError(
-                f"TensorRT engine input {target_w}x{target_h} is smaller than camera resolution {orig_w}x{orig_h}"
-            )
-        crop_pad = max(0, target_h - orig_h)
-        backend = TensorRTBackend.load_from_onnx_dir(args.onnx_dir, crop_pad=crop_pad)
-        transform_config = [
-            {"NAME": "RightTopPad", "SIZE": [target_h, target_w]},
-            {"NAME": "NormalizeImage", "MEAN": backend.trt_runner.cfg.get("normalize_mean", [0.485, 0.456, 0.406]),
-             "STD": backend.trt_runner.cfg.get("normalize_std", [0.229, 0.224, 0.225])},
-        ]
-    else:
-        cfgs = load_config(args.config)
-        if args.weights:
-            cfgs.MODEL.PRETRAINED_MODEL = args.weights
-        target_h, target_w = _infer_target_size_from_config(cfgs, orig_h, orig_w)
-        if target_h < orig_h or target_w < orig_w:
-            raise ValueError(
-                f"Inference target {target_w}x{target_h} is smaller than camera resolution {orig_w}x{orig_h}"
-            )
-        crop_pad = max(0, target_h - orig_h)
-        transform_config = _make_transform_config(cfgs, target_h, target_w)
-        logger = logging.getLogger("infercam")
-        logging.basicConfig(level=logging.INFO)
-        backend = PyTorchBackend.build_from_config(
-            args, cfgs, device, logger, crop_pad=crop_pad
-        )
-
-    preprocessor = Preprocessor(device, transform_config=transform_config,
-                                target_height=target_h, target_width=target_w)
-    async_infer = AsyncInference(backend, preprocessor, latency_monitor,
-                                  input_queue_size=2, output_queue_size=2)
-
+    calibration_w, calibration_h = load_camera_resolution(args.cam_file)
+    video_src = None
     if args.video:
         video_src = StereoVideoSource(args.video, loop=True)
+        orig_w, orig_h = video_src.half_w, video_src.frame_height
+        if (orig_w, orig_h) != (calibration_w, calibration_h):
+            scale_x = orig_w / calibration_w
+            scale_y = orig_h / calibration_h
+            K = K.copy()
+            K[0, 0] *= scale_x
+            K[0, 2] *= scale_x
+            K[1, 1] *= scale_y
+            K[1, 2] *= scale_y
+            print(
+                "[WARNING] Video per-eye resolution differs from the camera "
+                "calibration; intrinsic parameters were scaled to the video size"
+            )
+    else:
+        orig_w, orig_h = calibration_w, calibration_h
+    latency_monitor = LatencyMonitor()
+    prefix = (
+        f"[{args.openvino_device}] " if args.backend == "openvino"
+        else ""
+    )
+
+    runtime = build_runtime(
+        args,
+        orig_h=orig_h,
+        orig_w=orig_w,
+        allow_resize=True,
+    )
+    backend = runtime.backend
+    preprocessor = runtime.preprocessor
+    target_h, target_w = runtime.target_h, runtime.target_w
+    spatial_transform = runtime.spatial_transform
+    disparity_postprocessor = runtime.postprocessor
+    async_infer = AsyncInference(backend, preprocessor, latency_monitor,
+                                  input_queue_size=2, output_queue_size=2,
+                                  spatial_transform=spatial_transform)
+
+    source_resize_for_inference = spatial_transform.requires_resize
+    camera_inference_resolution = (target_w, target_h)
+
+    if args.video:
         async_cam = AsyncCamera(max_queue_size=2, map_dir=args.cam_file, vid_pid=vidpid_content,
-                                latency_monitor=latency_monitor, camera=video_src)
+                                latency_monitor=latency_monitor, camera=video_src,
+                                inference_resolution=camera_inference_resolution,
+                                preprocessing_mode=args.camera_preprocess)
     else:
         async_cam = AsyncCamera(max_queue_size=200, map_dir=args.cam_file, vid_pid=vidpid_content,
                                 latency_monitor=latency_monitor,
-                                camera_resolution=(orig_w, orig_h))
+                                camera_resolution=(orig_w, orig_h),
+                                inference_resolution=camera_inference_resolution,
+                                preprocessing_mode=args.camera_preprocess)
     async_cam.start()
 
     print("[INFO] Waiting for first frame to validate camera resolution...")
@@ -156,15 +202,40 @@ def main():
         time.sleep(0.05)
         frame, frame_id = async_cam.get_frame()
     actual_h, actual_w = frame["left"].shape[:2]
-    if (actual_w, actual_h) != (orig_w, orig_h):
+    expected_capture_size = camera_inference_resolution
+    if (actual_w, actual_h) != expected_capture_size:
         async_cam.stop()
         async_infer.stop()
         raise ValueError(
-            f"Camera frame resolution mismatch: resolution.txt={orig_w}x{orig_h}, actual frame={actual_w}x{actual_h}"
+            f"Camera frame resolution mismatch: expected "
+            f"{expected_capture_size[0]}x{expected_capture_size[1]}, "
+            f"actual frame={actual_w}x{actual_h}"
         )
 
-    print(f"[INFO] Original resolution from camera config: {orig_w}x{orig_h}")
-    print(f"[INFO] Inference resolution: {target_w}x{target_h}, crop_pad={crop_pad}")
+    source_label = "video per-eye" if args.video else "camera config"
+    print(f"[INFO] Source resolution ({source_label}): {orig_w}x{orig_h}")
+    if source_resize_for_inference:
+        aspect_note = ""
+        if orig_w * target_h != target_w * orig_h:
+            aspect_note = " The aspect ratio will change."
+        print(
+            f"[WARNING] Camera resolution {orig_w}x{orig_h} does not match "
+            f"the inference input {target_w}x{target_h}; camera frames will be "
+            f"resized before inference.{aspect_note}"
+        )
+        method = (
+            "auto rectification + resize"
+            if async_cam.fused_rectify_resize
+            else (
+                "legacy rectification then resize"
+                if args.camera_preprocess == "legacy"
+                else "capture-thread resize"
+            )
+        )
+        print(f"[INFO] Camera preprocessing method: {method}")
+    print(f"[INFO] Inference resolution: {target_w}x{target_h}")
+    if source_resize_for_inference:
+        print(f"[INFO] Disparity upsampling: {args.disparity_upsample}")
     print("[INFO] Press 'q' or Esc to quit, 'd' to toggle debug")
 
     fps_intervals = deque(maxlen=30)
@@ -193,8 +264,8 @@ def main():
                     latency_monitor.record_submit_to_inference_queue(frame_id)
                     async_infer.submit(frame, frame_id, (orig_h, orig_w))
 
-            raw_result = async_infer.get_result(block_timeout=0.001)
-            if raw_result is None or raw_result[1] is None:
+            inference_result = async_infer.get_result(block_timeout=0.001)
+            if inference_result is None:
                 if view_mode == "3d" and o3d_vis.is_initialized and not o3d_vis.spin_once():
                     view_mode = "2d"
                 key = cv2.waitKey(1) & 0xFF
@@ -212,19 +283,21 @@ def main():
                         o3d_vis.close()
                 continue
 
-            _, disp_raw_cpu, _, _, result_id, orig_size, model_gpu_ms = raw_result
+            result_id = inference_result.frame_id
+            model_gpu_ms = inference_result.model_ms
             latency_monitor.record_result_fetched(result_id)
-            disp_raw_cpu = check_and_fix_invalid(disp_raw_cpu, "disparity")
+            restored = disparity_postprocessor.restore(
+                inference_result.native_disparity,
+                inference_result.spatial_transform,
+                max_disp=backend.max_disp,
+            )
+            disp_raw_cpu = restored.disparity
 
             left_img = None
             for fid, l_img, _ in frame_buffer:
                 if fid == result_id:
                     left_img = l_img
                     break
-
-            if orig_size:
-                oh, ow = orig_size
-                disp_raw_cpu = disp_raw_cpu[:oh, :ow]
 
             disp_vis_cpu = create_visualization_from_raw(disp_raw_cpu)
             disp_color = create_disparity_colormap(disp_vis_cpu)
@@ -241,6 +314,12 @@ def main():
             last_frame_time = now
 
             if view_mode == "3d" and left_img is not None:
+                if left_img.shape[:2] != disp_raw_cpu.shape[:2]:
+                    left_img = cv2.resize(
+                        left_img,
+                        (disp_raw_cpu.shape[1], disp_raw_cpu.shape[0]),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
                 pc_processor.submit(disp_raw_cpu, left_img, result_id)
 
             if view_mode == "3d":

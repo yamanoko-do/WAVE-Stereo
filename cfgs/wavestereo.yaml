@@ -9,6 +9,10 @@ MODEL:
   VALID_ITERS: 4
   LEFT_ATT: true
   HIDDEN_DIM: 64
+  # standard: original learned 3x3 weighted upsampling
+  # consistency_guided: suppress cross-edge mixing using disparity consistency
+  CONTEXT_UPSAMPLE_MODE: consistency_guided
+  CONTEXT_UPSAMPLE_SIGMA: 2.0
   BACKBONE: MobileNetv2
   TF_DIM: 128
   TF_LAYERS: 3

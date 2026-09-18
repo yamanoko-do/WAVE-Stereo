@@ -1,10 +1,15 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from wavestereo.layers.basic_block_2d import BasicConv2d
 from wavestereo.layers.cost_volume import correlation_volume
 from wavestereo.layers.disp_regression import disparity_regression, ste_peak_soft_argmax
-from wavestereo.layers.disp_refinement import context_upsample
+from wavestereo.layers.disp_refinement import (
+    CONTEXT_UPSAMPLE_MODES,
+    context_upsample,
+)
 from .backbone import Backbone
 from .aggregation import Aggregation
 from .geometry import Geo_Encoding_Volume
@@ -23,6 +28,24 @@ class WAVEStereo(nn.Module):
         self.corr_levels = cfgs.CORR_LEVELS
         self.enable_noc_mask = cfgs.get('ENABLE_NOC_MASK', False)
         self.init_mode = cfgs.get('INIT_MODE', 'softargmax')  # 'softargmax' | 'peak_softargmax'
+        self.context_upsample_mode = str(
+            cfgs.get('CONTEXT_UPSAMPLE_MODE', 'standard')
+        ).lower()
+        if self.context_upsample_mode not in CONTEXT_UPSAMPLE_MODES:
+            supported = ", ".join(sorted(CONTEXT_UPSAMPLE_MODES))
+            raise ValueError(
+                f"Unsupported CONTEXT_UPSAMPLE_MODE "
+                f"{self.context_upsample_mode!r}; expected: {supported}"
+            )
+        self.context_upsample_sigma = float(
+            cfgs.get('CONTEXT_UPSAMPLE_SIGMA', 2.0)
+        )
+        self.context_upsample_reference_mode = 'argmax'
+        if (
+            not math.isfinite(self.context_upsample_sigma)
+            or self.context_upsample_sigma <= 0.0
+        ):
+            raise ValueError("CONTEXT_UPSAMPLE_SIGMA must be a positive finite value")
 
         # backbone
         self.backbone = Backbone(cfgs.get('BACKBONE', 'MobileNetv2'), pretrained=cfgs.get('BACKBONE_PRETRAINED', False))
@@ -66,7 +89,13 @@ class WAVEStereo(nn.Module):
         xspx = self.spx_1_gru(xspx, stem_1x)
         spx_pred = self.spx_gru(xspx)
         spx_pred = F.softmax(spx_pred, 1)
-        up_disp = context_upsample(disp * 4., spx_pred).unsqueeze(1)
+        up_disp = context_upsample(
+            disp * 4.,
+            spx_pred,
+            mode=self.context_upsample_mode,
+            consistency_sigma=self.context_upsample_sigma,
+            reference_mode=self.context_upsample_reference_mode,
+        ).unsqueeze(1)
         return up_disp.float()
 
     def forward(self, data):
